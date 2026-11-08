@@ -1,4 +1,5 @@
 """Streamlit UI.  Run:  streamlit run app.py"""
+import importlib
 import io
 import json
 import os
@@ -9,6 +10,18 @@ from pathlib import Path
 import altair as alt
 import pandas as pd
 import streamlit as st
+
+import promo_finder.heuristic
+import promo_finder.llm
+import promo_finder.parser
+import promo_finder.pipeline
+import promo_finder.prompts
+
+# Streamlit Cloud re-runs app.py after a git push but keeps modules it already imported, so new code in
+# promo_finder/ would not load until a manual reboot (ImportError on new names). Reload them in dependency
+# order on every run: cheap, and they hold no state.
+for _mod in (promo_finder.prompts, promo_finder.parser, promo_finder.heuristic, promo_finder.llm, promo_finder.pipeline):
+    importlib.reload(_mod)
 
 from promo_finder.llm import DEFAULT_MODELS, LLM
 from promo_finder.parser import load_show
