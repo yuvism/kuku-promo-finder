@@ -71,6 +71,9 @@ if files:
 
 if res := st.session_state.get("res"):
     m = res["meta"]
+    errs = [f"Ep {s['episode']}: {s['error']}" for s in res["scans"] if s.get("error")]
+    if errs:  # surface failed episodes instead of silently showing 0 promos
+        st.error(f"{len(errs)} of {m['episodes']} episodes failed. First error: {errs[0]}")
     c = st.columns(5)
     c[0].metric("Proposed", m["proposed"])
     c[1].metric("Failed rules", m["rejected_by_rules"])
@@ -86,18 +89,19 @@ if res := st.session_state.get("res"):
     st.subheader("Ranked promos")
     st.dataframe(pd.DataFrame(rows), hide_index=True)
 
-    st.subheader("Inspect a promo")
-    pick = st.selectbox("Promo", [f"#{p['rank']} {p['id']} ({p['score']})" for p in res["ranked"]])
-    p = res["ranked"][int(pick.split()[0][1:]) - 1]
-    j = p.get("judge") or {}
-    a, b = st.columns([3, 2])
-    a.code(p.get("transcript", ""), language=None)
-    b.markdown(f"**Hook:** {p.get('hook')}  \n**Cliffhanger:** {p.get('cliffhanger')}  \n**Why:** {p.get('why')}  \n"
-               f"**Context a new viewer lacks:** {p.get('context_needed')}")
-    b.markdown(f"**Cold-viewer judge** (sees only this clip): hook {j.get('hook')}/5 · cliffhanger "
-               f"{j.get('cliffhanger')}/5 · standalone {j.get('standalone')}/5 · overall {j.get('overall')}/10  \n"
-               f"*Read it as:* {j.get('what_happens')}  \n*Confused by:* {', '.join(j.get('confusing') or []) or 'nothing'}")
-    b.json(p["segments"], expanded=False)
+    if res["ranked"]:  # selectbox returns None on an empty list, which crashed the line below
+        st.subheader("Inspect a promo")
+        pick = st.selectbox("Promo", [f"#{p['rank']} {p['id']} ({p['score']})" for p in res["ranked"]])
+        p = res["ranked"][int(pick.split()[0][1:]) - 1]
+        j = p.get("judge") or {}
+        a, b = st.columns([3, 2])
+        a.code(p.get("transcript", ""), language=None)
+        b.markdown(f"**Hook:** {p.get('hook')}  \n**Cliffhanger:** {p.get('cliffhanger')}  \n**Why:** {p.get('why')}  \n"
+                   f"**Context a new viewer lacks:** {p.get('context_needed')}")
+        b.markdown(f"**Cold-viewer judge** (sees only this clip): hook {j.get('hook')}/5 · cliffhanger "
+                   f"{j.get('cliffhanger')}/5 · standalone {j.get('standalone')}/5 · overall {j.get('overall')}/10  \n"
+                   f"*Read it as:* {j.get('what_happens')}  \n*Confused by:* {', '.join(j.get('confusing') or []) or 'nothing'}")
+        b.json(p["segments"], expanded=False)
 
     with st.expander(f"Rejected by rule checks ({len(res['rejected'])})"):
         st.json(res["rejected"], expanded=False)
