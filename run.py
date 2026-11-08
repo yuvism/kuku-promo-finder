@@ -35,6 +35,8 @@ show = a.show or Path(a.input).stem.split("-scripts")[0].replace("_", " ").strip
 llm = LLM(a.provider, a.model, min_interval=0 if a.provider == "heuristic" else a.min_interval,
           cache_dir=Path(a.out) / ".cache")
 slug = "".join(c if c.isalnum() else "_" for c in show)[:40] + f"__{llm.provider}"
+if a.episodes:  # test runs get their own folder so they never overwrite a full run (cache is still shared)
+    slug += f"__first{a.episodes}ep"
 strong = LLM(a.provider, a.strong_model, min_interval=a.min_interval,
              cache_dir=Path(a.out) / ".cache") if a.strong_model else None
 run(eps, show, llm, Path(a.out) / slug, cross=not a.no_cross, workers=a.workers, cross_llm=strong)

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import re
 import time
@@ -20,6 +21,8 @@ from .parser import Beat, Episode, beat_index, fmt
 
 MIN_DUR, MAX_DUR, HOOK_WINDOW = 20.0, 60.0, 3.0
 TOL = 0.0  # duration is measured AFTER snapping, so it is the real clip length: 20-60s is a hard rule
+SCENE_TAIL, SCENE_HEAD = 8.0, 60.0  # episode N's last 8s + episode N+1's first 60s = one continuing scene
+RESOLUTION_PENALTY = 10.0           # score points lost when the judge says the clip shows the payoff
 
 
 # ---------------------------------------------------------------- validation (pure code)
@@ -75,6 +78,18 @@ def validate(promo: dict, idx: dict[str, Beat], eps: dict[int, Episode]) -> list
     return errs
 
 
+def _auto_fix_hook(p: dict, errs: list[str], idx: dict[str, Beat], eps) -> list[str] | None:
+    """Code-side fix for the most common failure (the LLM can't do timing maths): if the ONLY problem is a late
+    hook, start the clip on the hook beat, keep the end, and re-validate. None = not applicable."""
+    hb = p.get("hook_beat")
+    if len(errs) != 1 or not errs[0].startswith("hook lands at") or hb not in idx or not p.get("segments"):
+        return None
+    p["segments"][0]["start_beat"] = hb
+    if "start_beat" in p:
+        p["start_beat"] = hb
+    return validate(p, idx, eps)
+
+
 # ---------------------------------------------------------------- LLM stages
 def scan_episode(llm: LLM, show: str, ep: Episode, prev: Episode | None, total: int,
                  idx, eps) -> dict:
@@ -86,7 +101,12 @@ def scan_episode(llm: LLM, show: str, ep: Episode, prev: Episode | None, total: 
     good, bad = [], []
     for p in out.get("promos", []):
         p["source"] = "single-episode"
-        (bad if (e := validate(p, idx, eps)) else good).append((p, e))
+        e = validate(p, idx, eps)
+        if e and (e2 := _auto_fix_hook(p, e, idx, eps)) is not None:
+            p["auto_fix_from_errors"] = e  # keep what was wrong for the record
+            p["auto_fixed"] = not e2
+            e = e2                         # still failing -> LLM repair sees the moved start + remaining error
+        (bad if e else good).append((p, e))
     repaired, rejected = [], []
     if bad:
         errors = "\n".join(json.dumps({**{k: p.get(k) for k in ("start_beat", "hook_beat", "end_beat", "hook", "cliffhanger")},
@@ -180,10 +200,16 @@ def score(p: dict, total_eps: int) -> float:
     penalty = min(0.10, 0.03 * len(j.get("confusing") or []))
     s = (0.30 * _n(j.get("hook")) + 0.25 * _n(j.get("cliffhanger")) + 0.20 * _n(j.get("standalone"))
          + 0.10 * _n(j.get("overall"), 1, 10) + 0.08 * dur_fit + 0.07 * early - penalty)
+    resolves = shows_resolution(p)
     p["score_parts"] = {"hook": j.get("hook"), "cliffhanger": j.get("cliffhanger"), "standalone": j.get("standalone"),
                         "overall": j.get("overall"), "duration_fit": dur_fit, "early_episode": round(early, 2),
-                        "confusion_penalty": penalty}
-    return round(100 * s, 1)
+                        "confusion_penalty": penalty, "resolution_penalty": RESOLUTION_PENALTY if resolves else 0}
+    return round(100 * s - (RESOLUTION_PENALTY if resolves else 0), 1)
+
+
+def shows_resolution(p: dict) -> bool:
+    v = (p.get("judge") or {}).get("shows_resolution")
+    return v is True or str(v).strip().lower() in ("true", "yes")
 
 
 def _overlap(a: dict, b: dict) -> float:
@@ -195,15 +221,27 @@ def _overlap(a: dict, b: dict) -> float:
     return inter / max(min(a["duration"], b["duration"]), 1e-6)
 
 
-def rank(promos: list[dict], total_eps: int) -> tuple[list[dict], list[dict]]:
+def _continues_scene(a: dict, b: dict, epmap: dict[int, Episode]) -> bool:
+    """One promo ends in the last 8s of episode N and the other starts in the first 60s of episode N+1."""
+    def tail_head(x, y):
+        last, first = x["segments"][-1], y["segments"][0]
+        ep = epmap.get(last["episode"])
+        return (ep is not None and first["episode"] == last["episode"] + 1
+                and last["end"] >= ep.duration - SCENE_TAIL and first["start"] <= SCENE_HEAD)
+    return tail_head(a, b) or tail_head(b, a)
+
+
+def rank(promos: list[dict], total_eps: int, epmap: dict[int, Episode] | None = None) -> tuple[list[dict], list[dict]]:
     for p in promos:
         p["score"] = score(p, total_eps)
-    promos.sort(key=lambda p: -p["score"])
+    promos.sort(key=lambda p: -p["score"])  # so the higher score is always the one kept
     kept, dupes = [], []
     for p in promos:
-        twin = next((k for k in kept if _overlap(p, k) > 0.5), None)
+        twin, reason = next((k for k in kept if _overlap(p, k) > 0.5), None), "overlaps a higher-scored promo by >50%"
+        if not twin and epmap:
+            twin, reason = next((k for k in kept if _continues_scene(p, k, epmap)), None), "continues scene"
         if twin:
-            dupes.append({**p, "duplicate_of": twin["id"]})
+            dupes.append({**p, "duplicate_of": twin["id"], "reason": reason})
         else:
             kept.append(p)
     for i, p in enumerate(kept, 1):
@@ -256,12 +294,15 @@ def run(episodes: list[Episode], show: str, llm: LLM, out_dir: str | Path,
         p["id"] = f"P{i:03d}"
     log(f"Cold-viewer judging {len(promos)} promos...")
     judge(llm, promos, epmap)
-    ranked, dupes = rank(promos, total)
+    ranked, dupes = rank(promos, total, epmap)
 
     meta = {"show": show, "episodes": total, "provider": llm.provider, "model": llm.model,
             "proposed": len(promos) + len(rejected), "valid": len(promos), "rejected_by_rules": len(rejected),
+            "auto_fixed": sum(1 for p in promos if p.get("auto_fixed")),
             "repaired": sum(1 for p in promos if p.get("repaired")), "duplicates_removed": len(dupes),
-            "final": len(ranked), "llm_usage": llm.usage,
+            "duplicates_scene_continuation": sum(1 for d in dupes if d.get("reason") == "continues scene"),
+            "final": len(ranked), "final_showing_resolution": sum(1 for p in ranked if shows_resolution(p)),
+            "llm_usage": llm.usage,
             "cross_model": (cross_llm.model if cross_llm else llm.model),
             "cross_llm_usage": (cross_llm.usage if cross_llm else None),  # strong-model call is not in llm_usage
             "est_cost_usd": round(llm.cost_usd() + (cross_llm.cost_usd() if cross_llm else 0), 4),
@@ -286,32 +327,105 @@ def _write(out: Path, ranked, rejected, dupes, scans, meta, epmap):
     with open(out / "promos_ranked.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["rank", "id", "score", "type", "duration_s", "segments", "hook", "cliffhanger", "why",
-                    "judge_hook", "judge_cliff", "judge_standalone", "judge_overall", "confusing", "cold_viewer_read"])
+                    "judge_hook", "judge_cliff", "judge_standalone", "judge_overall", "confusing", "cold_viewer_read",
+                    "shows_resolution", "resolution_reason", "fixed_by"])
         for p in ranked:
             j = p.get("judge") or {}
             w.writerow([p["rank"], p["id"], p["score"], p["source"], p["duration"], _seg_str(p), p.get("hook"),
                         p.get("cliffhanger"), p.get("why"), j.get("hook"), j.get("cliffhanger"), j.get("standalone"),
-                        j.get("overall"), "; ".join(j.get("confusing") or []), j.get("what_happens")])
+                        j.get("overall"), "; ".join(j.get("confusing") or []), j.get("what_happens"),
+                        shows_resolution(p), j.get("resolution_reason"), fixed_by(p)])
+    (out / "cut_list.csv").write_text(cut_list_csv(ranked), encoding="utf-8", newline="")
+    (out / "cut_commands.sh").write_text(cut_commands_sh(ranked), encoding="utf-8", newline="\n")
     (out / "report.md").write_text(report(ranked, rejected, dupes, meta), encoding="utf-8")
+
+
+# ---------------------------------------------------------------- editor hand-off (pure code)
+def cut_list_csv(ranked: list[dict]) -> str:
+    """One row per segment: what an editor needs to cut every ranked promo."""
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(["rank", "promo_id", "segment", "episode", "start_ts", "end_ts", "duration"])
+    for p in ranked:
+        for i, s in enumerate(p["segments"], 1):
+            w.writerow([p["rank"], p["id"], i, s["episode"], s["start_ts"], s["end_ts"], round(s["end"] - s["start"], 2)])
+    return buf.getvalue()
+
+
+def cut_commands_sh(ranked: list[dict], top: int = 20) -> str:
+    """ffmpeg script that cuts the top promos from per-episode videos named ep01.mp4, ep02.mp4, ...
+    Re-encodes each segment (frame-accurate cuts), then joins multi-segment promos with the concat demuxer."""
+    L = ["#!/usr/bin/env bash",
+         f"# Cuts the top {top} promos with ffmpeg. Input: one video per episode named ep01.mp4, ep02.mp4, ...",
+         "# (placeholder names: rename your files or point VIDEO_DIR at them). Times assume each video starts",
+         "# at the script's 00:00. Usage:  VIDEO_DIR=/path/to/episodes OUT_DIR=promos bash cut_commands.sh",
+         "set -euo pipefail",
+         'VIDEO_DIR="${VIDEO_DIR:-.}"', 'OUT_DIR="${OUT_DIR:-promos}"', 'mkdir -p "$OUT_DIR"',
+         "ENC=(-c:v libx264 -preset veryfast -crf 18 -c:a aac -b:a 192k)", ""]
+    ff = "ffmpeg -hide_banner -loglevel error -y"
+    for p in ranked[:top]:
+        name = f"promo_{p['rank']:02d}_{p['id']}"
+        L.append(f"# #{p['rank']} {p['id']} ({p['duration']:.1f}s): {_seg_str(p)}")
+        segs = p["segments"]
+        parts = [f"{name}.mp4"] if len(segs) == 1 else [f"{name}_seg{i}.mp4" for i in range(1, len(segs) + 1)]
+        for s, part in zip(segs, parts):
+            L.append(f'{ff} -ss {s["start"]:.3f} -i "$VIDEO_DIR/ep{s["episode"]:02d}.mp4" '
+                     f'-t {s["end"] - s["start"]:.3f} "${{ENC[@]}}" "$OUT_DIR/{part}"')
+        if len(segs) > 1:
+            L += [f"printf \"file '%s'\\n\" {' '.join(parts)} > \"$OUT_DIR/{name}.txt\"",
+                  f'{ff} -f concat -safe 0 -i "$OUT_DIR/{name}.txt" -c copy "$OUT_DIR/{name}.mp4"',
+                  f'rm "$OUT_DIR/{name}.txt" ' + " ".join(f'"$OUT_DIR/{x}"' for x in parts)]
+        L.append("")
+    L.append('echo "Done: promos are in $OUT_DIR"')
+    return "\n".join(L) + "\n"
+
+
+def fixed_by(p: dict) -> str:
+    return "code (hook moved)" if p.get("auto_fixed") else "LLM repair" if p.get("repaired") else ""
+
+
+def load_results(files: dict[str, bytes]) -> dict:
+    """Rebuild a run result from saved JSON outputs (promos_ranked.json required; run_meta.json and
+    rejected_by_rules.json optional), so results can be browsed without re-running or an API key."""
+    ranked, meta, rejected = None, {}, []
+    for name, data in files.items():
+        obj = json.loads(data.decode("utf-8"))
+        if isinstance(obj, dict) and "final" in obj:
+            meta = obj
+        elif isinstance(obj, list) and obj and isinstance(obj[0], dict) and "rank" in obj[0]:
+            ranked = obj
+        elif isinstance(obj, list) and obj and isinstance(obj[0], dict) and "errors" in obj[0]:
+            rejected = obj
+    if ranked is None:
+        raise ValueError("no promos_ranked.json found (a JSON list of promos with a 'rank' field)")
+    meta = {"proposed": "n/a", "rejected_by_rules": len(rejected), "duplicates_removed": "n/a",
+            "est_cost_usd": "n/a", "episodes": "n/a", **meta, "final": len(ranked)}
+    return {"ranked": ranked, "rejected": rejected, "duplicates": [], "scans": [], "meta": meta}
 
 
 def report(ranked, rejected, dupes, meta) -> str:
     L = [f"# Promo report: {meta['show']}",
          f"Model `{meta['provider']}/{meta['model']}` | {meta['episodes']} episodes | "
          f"{meta['proposed']} proposed, {meta['rejected_by_rules']} rejected by rules, "
-         f"{meta['repaired']} repaired, {meta['duplicates_removed']} duplicates removed, {meta['final']} final | "
+         f"{meta.get('auto_fixed', 0)} auto-fixed (hook moved by code), {meta['repaired']} repaired by LLM, "
+         f"{meta['duplicates_removed']} duplicates removed ({meta.get('duplicates_scene_continuation', 0)} continue a "
+         f"scene across episodes), {meta['final']} final | "
          f"{meta['llm_usage']['calls'] + (meta.get('cross_llm_usage') or {}).get('calls', 0)} calls, "
          f"~${meta['est_cost_usd']} | {meta['wall_seconds']}s", "",
          "## Post these first (top 10)", ""]
     for p in ranked[:10]:
         j = p.get("judge") or {}
-        L += [f"**#{p['rank']} {p['id']}** ({p['score']}) {p['source']}, {p['duration']:.0f}s: {_seg_str(p)}",
+        fix = f" ({fixed_by(p)})" if fixed_by(p) else ""
+        L += [f"**#{p['rank']} {p['id']}** ({p['score']}) {p['source']}{fix}, {p['duration']:.0f}s: {_seg_str(p)}",
               f"- Hook: {p.get('hook')}", f"- Cliffhanger: {p.get('cliffhanger')}", f"- Why: {p.get('why')}",
               f"- Cold viewer: hook {j.get('hook')}/5, cliff {j.get('cliffhanger')}/5, "
-              f"standalone {j.get('standalone')}/5. Read it as: {j.get('what_happens')}", ""]
+              f"standalone {j.get('standalone')}/5. Read it as: {j.get('what_happens')}",
+              f"- Shows resolution: {'YES (-10 pts)' if shows_resolution(p) else 'no'}. {j.get('resolution_reason') or ''}", ""]
     weak = [p for p in ranked if (p.get("judge") or {}).get("standalone", 5) <= 2 or (p.get("judge") or {}).get("hook", 5) <= 2]
+    resolved = [p["id"] for p in ranked if shows_resolution(p)]
     L += ["## Where it picks badly", "",
           f"- {len(rejected)} proposals broke hard rules (length / hook timing / bad beat IDs) and were dropped. See rejected_by_rules.json.",
+          f"- {len(resolved)} final promos show the resolution per the cold viewer (-10 pts each): {', '.join(resolved) or 'none'}",
           f"- {len(weak)} valid promos scored <=2 on hook or standalone by the cold viewer:"]
     for p in weak[:8]:
         j = p["judge"]

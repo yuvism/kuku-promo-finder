@@ -89,8 +89,10 @@ Be a tough, honest critic. Score each clip:
 - standalone (1-5): do you understand who is who and what is at stake without any prior context?
 - confusing: list anything that confused you (names you don't know, references to past events, unclear stakes). Empty list if none.
 - what_happens: one sentence describing what you think is going on.
+- shows_resolution (true/false): true if the clip shows how the tension resolves (who wins, the answer, the payoff).
+- resolution_reason: one line explaining shows_resolution.
 - overall (1-10): would you tap through to watch the show?
-Return JSON: {"judgements": [{"promo_id": "...", "hook": n, "cliffhanger": n, "standalone": n, "confusing": [...], "what_happens": "...", "overall": n}]}"""
+Return JSON: {"judgements": [{"promo_id": "...", "hook": n, "cliffhanger": n, "standalone": n, "confusing": [...], "what_happens": "...", "shows_resolution": true/false, "resolution_reason": "...", "overall": n}]}"""
 
 JUDGE_USER = """CLIPS:
 {clips}"""

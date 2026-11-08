@@ -21,9 +21,14 @@ DEFAULT_MODELS = {
     "heuristic": "keyword-baseline",   # offline, no API key; used as a baseline + for tests
 }
 
-# Rough public list prices (USD per 1M tokens, input/output) for cost estimates only.
+# Paid-tier list prices (USD per 1M tokens, input/output) for cost estimates only; free tier is $0.
+# Per-model first (checked 2026-11-08 at aistudio.google.com/docs/pricing), then a per-provider fallback.
+MODEL_PRICES = {
+    "gemini-3.5-flash-lite": (0.30, 2.50),
+    "gemini-3.8-flash": (0.75, 3.75),   # through 2026-12-31; $1.50 / $7.50 from 2027-01-01
+}
 PRICES = {
-    "gemini": (0.10, 0.40),
+    "gemini": (0.30, 2.50),
     "openai": (0.15, 0.60),
     "groq": (0.59, 0.79),
     "anthropic": (3.00, 15.00),
@@ -46,8 +51,9 @@ def _extract_json(text: str) -> dict:
 class LLM:
     def __init__(self, provider: str = "gemini", model: str | None = None,
                  api_key: str | None = None, cache_dir: str | Path = ".cache",
-                 temperature: float = 0.3, min_interval: float = 0.0):
+                 temperature: float = 0.3, min_interval: float = 0.0, base_url: str | None = None):
         self.provider = provider.lower()
+        self.base_url = base_url             # openai provider: any OpenAI-compatible endpoint
         self.model = model or DEFAULT_MODELS[self.provider]
         self.api_key = api_key
         self.temperature = temperature
@@ -96,7 +102,7 @@ class LLM:
         raise RuntimeError(f"LLM call failed after retries: {last_err}")
 
     def cost_usd(self) -> float:
-        pin, pout = PRICES.get(self.provider, (0, 0))
+        pin, pout = MODEL_PRICES.get(self.model) or PRICES.get(self.provider, (0, 0))
         return self.usage["in_tokens"] / 1e6 * pin + self.usage["out_tokens"] / 1e6 * pout
 
     # ---------- providers ----------
@@ -123,7 +129,7 @@ class LLM:
                                           base_url="https://api.groq.com/openai/v1")
                 else:
                     self._client = OpenAI(api_key=self.api_key or os.getenv("OPENAI_API_KEY"),
-                                          base_url=os.getenv("OPENAI_BASE_URL") or None)
+                                          base_url=self.base_url or os.getenv("OPENAI_BASE_URL") or None)
             r = self._client.chat.completions.create(
                 model=self.model, temperature=self.temperature,
                 response_format={"type": "json_object"},
