@@ -170,17 +170,18 @@ def clip_transcript(p: dict, eps: dict[int, Episode]) -> str:
     return "\n".join(lines[:-1])
 
 
-def judge(llm: LLM, promos: list[dict], eps, batch: int = 5) -> None:
+def judge(llm: LLM, promos: list[dict], eps, batch: int = 5, key: str = "judge") -> None:
+    """Cold-viewer judge. key="judge2" stores a second-opinion model's answers next to the main ones."""
     for i in range(0, len(promos), batch):
         chunk = promos[i:i + batch]
         clips = "\n\n".join(f"CLIP {p['id']} ({p['duration']:.0f}s):\n{clip_transcript(p, eps)}" for p in chunk)
-        out = llm.json(P.JUDGE_SYSTEM, P.JUDGE_USER.format(clips=clips), tag=f"judge-{i // batch:03d}")
+        out = llm.json(P.JUDGE_SYSTEM, P.JUDGE_USER.format(clips=clips), tag=f"{key}-{i // batch:03d}")
         by_id = {}  # models sometimes echo the label ("CLIP P011") instead of the bare id ("P011")
         for j in out.get("judgements", []):
             m = re.search(r"P\d+", str(j.get("promo_id")))
             by_id[m.group() if m else str(j.get("promo_id"))] = j
         for p in chunk:
-            p["judge"] = by_id.get(p["id"], {})
+            p[key] = by_id.get(p["id"], {})
 
 
 # ---------------------------------------------------------------- scoring (pure code)
@@ -191,25 +192,123 @@ def _n(x, lo=1, hi=5):
         return 0.0
 
 
-def score(p: dict, total_eps: int) -> float:
-    j = p.get("judge") or {}
+def _num(x) -> float | None:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _truthy(v) -> bool:
+    return v is True or str(v).strip().lower() in ("true", "yes")
+
+
+def judges_of(p: dict) -> list[dict]:
+    """The judgements a promo got: the main judge, plus the second-opinion judge if one ran."""
+    return [j for j in (p.get("judge"), p.get("judge2")) if j]
+
+
+def _resolution_share(js: list[dict]) -> float:
+    return sum(_truthy(j.get("shows_resolution")) for j in js) / len(js) if js else 0.0
+
+
+def score(p: dict, total_eps: int, judges: list[dict] | None = None) -> float:
+    """Weighted score. With two judges every judge field is AVERAGED. Pass `judges` to score with a chosen
+    subset (used to compare the judges); that leaves p untouched."""
+    js = judges_of(p) if judges is None else judges
+
+    def avg(k):
+        vals = [v for v in (_num(j.get(k)) for j in js) if v is not None]
+        return sum(vals) / len(vals) if vals else None
+
     dur = p["duration"]
     dur_fit = 1.0 if 25 <= dur <= 45 else 0.7
     first_ep = p["segments"][0]["episode"]
     early = 1 - (first_ep - 1) / max(total_eps - 1, 1)   # new viewers land on Ep 1; less spoiler risk
-    penalty = min(0.10, 0.03 * len(j.get("confusing") or []))
-    s = (0.30 * _n(j.get("hook")) + 0.25 * _n(j.get("cliffhanger")) + 0.20 * _n(j.get("standalone"))
-         + 0.10 * _n(j.get("overall"), 1, 10) + 0.08 * dur_fit + 0.07 * early - penalty)
-    resolves = shows_resolution(p)
-    p["score_parts"] = {"hook": j.get("hook"), "cliffhanger": j.get("cliffhanger"), "standalone": j.get("standalone"),
-                        "overall": j.get("overall"), "duration_fit": dur_fit, "early_episode": round(early, 2),
-                        "confusion_penalty": penalty, "resolution_penalty": RESOLUTION_PENALTY if resolves else 0}
-    return round(100 * s - (RESOLUTION_PENALTY if resolves else 0), 1)
+    n_confusing = sum(len(j.get("confusing") or []) for j in js) / len(js) if js else 0.0
+    penalty = min(0.10, 0.03 * n_confusing)
+    s = (0.30 * _n(avg("hook")) + 0.25 * _n(avg("cliffhanger")) + 0.20 * _n(avg("standalone"))
+         + 0.10 * _n(avg("overall"), 1, 10) + 0.08 * dur_fit + 0.07 * early - penalty)
+    res_penalty = RESOLUTION_PENALTY * _resolution_share(js)   # 10 if every judge says so, 5 if one of two
+    if judges is None:
+        p["score_parts"] = {"judges": len(js), "hook": avg("hook"), "cliffhanger": avg("cliffhanger"),
+                            "standalone": avg("standalone"), "overall": avg("overall"), "duration_fit": dur_fit,
+                            "early_episode": round(early, 2), "confusion_penalty": round(penalty, 3),
+                            "resolution_penalty": res_penalty}
+    return round(100 * s - res_penalty, 1)
 
 
 def shows_resolution(p: dict) -> bool:
-    v = (p.get("judge") or {}).get("shows_resolution")
-    return v is True or str(v).strip().lower() in ("true", "yes")
+    """True when at least half of the judges say the clip shows the payoff."""
+    js = judges_of(p)
+    return bool(js) and _resolution_share(js) >= 0.5
+
+
+def judge_disagreement(p: dict) -> list[str]:
+    """Where the two judges disagree a lot: >=2 points on a 1-5 score, >=3 on overall (1-10), or opposite
+    verdicts on shows_resolution. Any of these = 'needs human review'."""
+    a, b = p.get("judge") or {}, p.get("judge2") or {}
+    if not a or not b:
+        return []
+    out = []
+    for k, gap in (("hook", 2), ("cliffhanger", 2), ("standalone", 2), ("overall", 3)):
+        x, y = _num(a.get(k)), _num(b.get(k))
+        if x is not None and y is not None and abs(x - y) >= gap:
+            out.append(f"{k} {x:g} vs {y:g}")
+    if _truthy(a.get("shows_resolution")) != _truthy(b.get("shows_resolution")):
+        out.append("shows_resolution")
+    return out
+
+
+def _avg_ranks(vals: list[float]) -> list[float]:
+    order = sorted(range(len(vals)), key=lambda i: -vals[i])
+    ranks, i = [0.0] * len(vals), 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and vals[order[j + 1]] == vals[order[i]]:
+            j += 1
+        for k in range(i, j + 1):   # ties share the average rank
+            ranks[order[k]] = (i + j) / 2 + 1
+        i = j + 1
+    return ranks
+
+
+def spearman(x: list[float], y: list[float]) -> float | None:
+    if len(x) < 3:
+        return None
+    rx, ry = _avg_ranks(x), _avg_ranks(y)
+    mx, my = sum(rx) / len(rx), sum(ry) / len(ry)
+    cov = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+    vx, vy = sum((a - mx) ** 2 for a in rx), sum((b - my) ** 2 for b in ry)
+    return round(cov / (vx * vy) ** 0.5, 3) if vx and vy else None
+
+
+def compare_judges(ranked: list[dict], total_eps: int, labels: tuple[str, str]) -> tuple[dict, str]:
+    """Score every final promo with each judge alone and compare: rank correlation, top-10 overlap,
+    biggest disagreements. Returns (stats for run_meta, judge_comparison.csv text)."""
+    both = [p for p in ranked if p.get("judge") and p.get("judge2")]
+    s1 = [score(p, total_eps, [p["judge"]]) for p in both]
+    s2 = [score(p, total_eps, [p["judge2"]]) for p in both]
+    top = lambda s: {p["id"] for _, p in sorted(zip(s, both), key=lambda t: -t[0])[:10]}
+    gaps = sorted(zip(both, s1, s2), key=lambda t: -abs(t[1] - t[2]))
+    stats = {"judges": list(labels), "promos_compared": len(both), "spearman_rank_correlation": spearman(s1, s2),
+             "top10_overlap": len(top(s1) & top(s2)) if both else 0,
+             "needs_human_review": sum(1 for p in ranked if p.get("needs_human_review")),
+             "biggest_disagreements": [{"id": p["id"], "rank": p["rank"], f"{labels[0]}_score": a,
+                                        f"{labels[1]}_score": b, "where": judge_disagreement(p)}
+                                       for p, a, b in gaps[:5]]}
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    l1, l2 = labels
+    fields = ("hook", "cliffhanger", "standalone", "overall", "shows_resolution")
+    w.writerow(["rank", "promo_id", "final_score", f"{l1}_score", f"{l2}_score"]
+               + [f"{l}_{k}" for k in fields for l in labels] + ["needs_human_review", "disagreement"])
+    for p, a, b in zip(both, s1, s2):
+        row = [p["rank"], p["id"], p["score"], a, b]
+        for k in fields:
+            row += [p["judge"].get(k), p["judge2"].get(k)]
+        w.writerow(row + [bool(p.get("needs_human_review")), "; ".join(judge_disagreement(p))])
+    return stats, buf.getvalue()
 
 
 def _overlap(a: dict, b: dict) -> float:
@@ -252,7 +351,7 @@ def rank(promos: list[dict], total_eps: int, epmap: dict[int, Episode] | None = 
 # ---------------------------------------------------------------- orchestration
 def run(episodes: list[Episode], show: str, llm: LLM, out_dir: str | Path,
         cross: bool = True, workers: int = 1, log: Callable[[str], None] = print,
-        cross_llm: LLM | None = None) -> dict:
+        cross_llm: LLM | None = None, judge2_llm: LLM | None = None) -> dict:
     t0 = time.time()
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -294,7 +393,18 @@ def run(episodes: list[Episode], show: str, llm: LLM, out_dir: str | Path,
         p["id"] = f"P{i:03d}"
     log(f"Cold-viewer judging {len(promos)} promos...")
     judge(llm, promos, epmap)
+    if judge2_llm:  # second opinion from another model family; final score = average of both judges
+        log(f"Second-opinion judge {judge2_llm.provider}/{judge2_llm.model} on {len(promos)} promos...")
+        try:
+            judge(judge2_llm, promos, epmap, key="judge2")
+        except Exception as e:  # e.g. daily token cap: keep what was judged; the cache lets a re-run resume
+            log(f"  second judge stopped early ({e}); promos without it keep the single-judge score")
+        for p in promos:
+            if dis := judge_disagreement(p):
+                p["needs_human_review"], p["judge_disagreement"] = True, dis
     ranked, dupes = rank(promos, total, epmap)
+    labels = (_family(llm), _family(judge2_llm)) if judge2_llm else None
+    comparison, comparison_csv = compare_judges(ranked, total, labels) if judge2_llm else (None, None)
 
     meta = {"show": show, "episodes": total, "provider": llm.provider, "model": llm.model,
             "proposed": len(promos) + len(rejected), "valid": len(promos), "rejected_by_rules": len(rejected),
@@ -305,11 +415,23 @@ def run(episodes: list[Episode], show: str, llm: LLM, out_dir: str | Path,
             "llm_usage": llm.usage,
             "cross_model": (cross_llm.model if cross_llm else llm.model),
             "cross_llm_usage": (cross_llm.usage if cross_llm else None),  # strong-model call is not in llm_usage
-            "est_cost_usd": round(llm.cost_usd() + (cross_llm.cost_usd() if cross_llm else 0), 4),
+            "judge2_model": (f"{judge2_llm.provider}/{judge2_llm.model}" if judge2_llm else None),
+            "judge2_usage": (judge2_llm.usage if judge2_llm else None),
+            "judge_comparison": comparison,
+            "est_cost_usd": round(llm.cost_usd() + (cross_llm.cost_usd() if cross_llm else 0)
+                                  + (judge2_llm.cost_usd() if judge2_llm else 0), 4),
             "wall_seconds": round(time.time() - t0, 1)}
     _write(out, ranked, rejected, dupes, scans, meta, epmap)
+    if comparison_csv:
+        (out / "judge_comparison.csv").write_text(comparison_csv, encoding="utf-8", newline="")
     log(f"Done: {len(ranked)} ranked promos -> {out}")
     return {"ranked": ranked, "rejected": rejected, "duplicates": dupes, "scans": scans, "meta": meta}
+
+
+def _family(llm: LLM) -> str:
+    """Short label for a judge in column names: the model family when obvious, else the provider."""
+    m = llm.model.lower()
+    return next((f for f in ("llama", "gemini", "gpt", "claude", "qwen", "mistral") if f in m), llm.provider)
 
 
 def _seg_str(p):
@@ -420,7 +542,24 @@ def report(ranked, rejected, dupes, meta) -> str:
               f"- Hook: {p.get('hook')}", f"- Cliffhanger: {p.get('cliffhanger')}", f"- Why: {p.get('why')}",
               f"- Cold viewer: hook {j.get('hook')}/5, cliff {j.get('cliffhanger')}/5, "
               f"standalone {j.get('standalone')}/5. Read it as: {j.get('what_happens')}",
-              f"- Shows resolution: {'YES (-10 pts)' if shows_resolution(p) else 'no'}. {j.get('resolution_reason') or ''}", ""]
+              f"- Shows resolution: {'YES (-10 pts)' if shows_resolution(p) else 'no'}. {j.get('resolution_reason') or ''}"]
+        if p.get("judge2"):
+            j2 = p["judge2"]
+            L.append(f"- Second judge: hook {j2.get('hook')}/5, cliff {j2.get('cliffhanger')}/5, standalone "
+                     f"{j2.get('standalone')}/5, overall {j2.get('overall')}/10, resolution {j2.get('shows_resolution')}"
+                     + (f". **Needs human review** ({', '.join(p['judge_disagreement'])})" if p.get("needs_human_review") else ""))
+        L.append("")
+    if c := meta.get("judge_comparison"):
+        l1, l2 = c["judges"]
+        L += ["## Second-opinion judge", "",
+              f"`{meta['provider']}/{meta['model']}` vs `{meta['judge2_model']}` on {c['promos_compared']} final promos. "
+              f"Final score = average of both judges. Spearman rank correlation of their scores: "
+              f"**{c['spearman_rank_correlation']}**. Top-10 overlap: **{c['top10_overlap']}/10**. "
+              f"{c['needs_human_review']} final promos need human review (big disagreement). See judge_comparison.csv.",
+              "", "Biggest disagreements:"]
+        L += [f"- #{d['rank']} {d['id']}: {l1} {d[f'{l1}_score']} vs {l2} {d[f'{l2}_score']} "
+              f"({', '.join(d['where']) or 'many small gaps'})" for d in c["biggest_disagreements"]]
+        L.append("")
     weak = [p for p in ranked if (p.get("judge") or {}).get("standalone", 5) <= 2 or (p.get("judge") or {}).get("hook", 5) <= 2]
     resolved = [p["id"] for p in ranked if shows_resolution(p)]
     L += ["## Where it picks badly", "",

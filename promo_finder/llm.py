@@ -16,7 +16,7 @@ from pathlib import Path
 DEFAULT_MODELS = {
     "gemini": "gemini-3.5-flash-lite",  # free tier: 10 RPM / 500 RPD (3.8 Flash is only 20 RPD)
     "openai": "gpt-4o-mini",           # any OpenAI-compatible endpoint (set OPENAI_BASE_URL)
-    "groq": "llama-3.3-70b-versatile",
+    "groq": "openai/gpt-oss-120b",     # llama-3.3-70b-versatile is Enterprise-only on Groq now (404 on free keys)
     "anthropic": "claude-sonnet-4-5",
     "heuristic": "keyword-baseline",   # offline, no API key; used as a baseline + for tests
 }
@@ -26,6 +26,7 @@ DEFAULT_MODELS = {
 MODEL_PRICES = {
     "gemini-3.5-flash-lite": (0.30, 2.50),
     "gemini-3.8-flash": (0.75, 3.75),   # through 2026-12-31; $1.50 / $7.50 from 2027-01-01
+    "openai/gpt-oss-120b": (0.15, 0.60),  # Groq, console.groq.com/docs/models, checked 2026-11-09
 }
 PRICES = {
     "gemini": (0.30, 2.50),
@@ -125,6 +126,8 @@ class LLM:
             from openai import OpenAI
             if self._client is None:
                 if p == "groq":
+                    if not (self.api_key or os.getenv("GROQ_API_KEY")):  # else the OpenAI SDK blames OPENAI_API_KEY
+                        raise ValueError("GROQ_API_KEY is not set: add it to .env")
                     self._client = OpenAI(api_key=self.api_key or os.getenv("GROQ_API_KEY"),
                                           base_url="https://api.groq.com/openai/v1")
                 else:

@@ -21,6 +21,9 @@ ap.add_argument("--model", default=os.getenv("PROMO_MODEL"))
 ap.add_argument("--out", default="outputs")
 ap.add_argument("--strong-model", default=os.getenv("PROMO_STRONG_MODEL"),
                 help="optional stronger model for the single cross-episode call, e.g. gemini-3.8-flash")
+ap.add_argument("--judge-provider", default=None, choices=list(DEFAULT_MODELS),
+                help="second-opinion judge from another model family (default: none, main model judges alone)")
+ap.add_argument("--judge-model", default=None, help="model for --judge-provider (default: that provider's default)")
 ap.add_argument("--no-cross", action="store_true", help="skip multi-segment cross-episode promos")
 ap.add_argument("--episodes", type=int, default=0, help="only first N episodes (quick test)")
 ap.add_argument("--workers", type=int, default=1, help="parallel episode scans (paid APIs)")
@@ -39,4 +42,11 @@ if a.episodes:  # test runs get their own folder so they never overwrite a full 
     slug += f"__first{a.episodes}ep"
 strong = LLM(a.provider, a.strong_model, min_interval=a.min_interval,
              cache_dir=Path(a.out) / ".cache") if a.strong_model else None
-run(eps, show, llm, Path(a.out) / slug, cross=not a.no_cross, workers=a.workers, cross_llm=strong)
+judge2 = None
+if a.judge_provider or a.judge_model:  # defaults to the main model, in which case there is no second opinion
+    jp = a.judge_provider or a.provider
+    jm = a.judge_model or (DEFAULT_MODELS[jp] if jp != a.provider else llm.model)
+    if (jp, jm) != (llm.provider, llm.model):
+        judge2 = LLM(jp, jm, min_interval=a.min_interval, cache_dir=Path(a.out) / ".cache")
+        slug += f"__judge2-{jp}"   # its own folder: the single-judge run stays as it was
+run(eps, show, llm, Path(a.out) / slug, cross=not a.no_cross, workers=a.workers, cross_llm=strong, judge2_llm=judge2)

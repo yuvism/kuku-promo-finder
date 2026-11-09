@@ -34,6 +34,10 @@ python run.py path/to/scripts.zip --episodes 3
 # 500/day). --strong-model is used for 1 call only (3.8 Flash free tier is 20/day). Re-runs hit the cache.
 python run.py path/to/scripts.zip --strong-model gemini-3.8-flash
 
+# second-opinion judge from another model family: scores are averaged, big disagreements are flagged
+# "needs human review", and judge_comparison.csv compares the two (writes to a __judge2-<provider> folder)
+python run.py path/to/scripts.zip --strong-model gemini-3.8-flash --judge-provider groq --judge-model openai/gpt-oss-120b --min-interval 8
+
 # other models
 python run.py path/to/scripts.zip --provider groq
 python run.py path/to/scripts.zip --provider heuristic     # offline baseline
